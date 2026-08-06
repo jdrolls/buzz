@@ -66,6 +66,12 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// human interaction, so it must not share the short probe timeout.
 const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// Extra wall-clock budget after the configured turn cap for the normal
+/// hard-timeout cancellation and drain path. This exceeds the five-second
+/// control-cancel drain so the watchdog is only a backstop for a turn whose
+/// cancellation path is itself wedged.
+const TURN_WATCHDOG_GRACE: Duration = Duration::from_secs(35);
+
 /// Publish a kind:20001 presence update event via the WebSocket connection.
 ///
 /// Ephemeral kinds (20000-29999) are rejected by the HTTP bridge, so presence
@@ -1164,6 +1170,56 @@ struct SteerAckEvent {
     ack: std::result::Result<pool::SteerAck, tokio::sync::oneshot::error::RecvError>,
 }
 
+/// Arm an out-of-band absolute watchdog for a checked-out pool slot.
+///
+/// The prompt task can await relay or REST work between ACP read-loop selects,
+/// so its own hard deadline cannot protect those awaits. This watchdog runs as
+/// an independent Tokio task and aborts the whole prompt task at
+/// `max_turn_duration + TURN_WATCHDOG_GRACE`. Aborting drops `OwnedAgent`; its
+/// `AcpClient::Drop` kills the dedicated child process group. The JoinSet
+/// cancellation is then reconciled through `recover_panicked_agent`, which
+/// releases the queue marker and schedules a replacement for the slot.
+fn spawn_turn_watchdog(
+    abort_handle: tokio::task::AbortHandle,
+    turn_id: String,
+    channel_id: Option<Uuid>,
+    max_turn_duration: Duration,
+) {
+    spawn_turn_watchdog_after(
+        abort_handle,
+        turn_id,
+        channel_id,
+        max_turn_duration + TURN_WATCHDOG_GRACE,
+        max_turn_duration,
+    );
+}
+
+/// Spawn the watchdog with an explicit budget.
+///
+/// Kept separate from [`spawn_turn_watchdog`] so the deadline behavior can be
+/// tested without waiting for the production grace interval. The watchdog is
+/// bounded even after a task completes: aborting an already-completed Tokio
+/// task is a no-op, and the timer exits after this one deadline.
+fn spawn_turn_watchdog_after(
+    abort_handle: tokio::task::AbortHandle,
+    turn_id: String,
+    channel_id: Option<Uuid>,
+    budget: Duration,
+    configured_cap: Duration,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(budget).await;
+        tracing::warn!(
+            turn_id = %turn_id,
+            channel_id = ?channel_id,
+            elapsed_secs = budget.as_secs(),
+            configured_cap_secs = configured_cap.as_secs(),
+            "absolute turn watchdog fired — aborting stuck task and replacing its slot"
+        );
+        abort_handle.abort();
+    });
+}
+
 /// RAII guard that ensures a `RespawnResult` is sent even if the task panics.
 /// Without this, a panicked respawn task would leave `respawn_in_flight = true`
 /// permanently, silently losing the slot forever.
@@ -2159,13 +2215,26 @@ async fn tokio_main() -> Result<()> {
                                 )
                                 .await;
                                 if !allowed {
-                                    tracing::debug!(
-                                        channel_id = %buzz_event.channel_id,
-                                        author = %buzz_event.event.pubkey.to_hex(),
-                                        mode = %config.respond_to,
-                                        is_dm,
-                                        "inbound author gate — dropping event"
-                                    );
+                                    if author_gate_rejection_is_explicit_mention(
+                                        &buzz_event.event,
+                                        &pubkey_hex,
+                                    ) {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            author = %author,
+                                            mode = %config.respond_to,
+                                            is_dm,
+                                            "inbound author gate rejected explicit @mention"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            channel_id = %buzz_event.channel_id,
+                                            author = %author,
+                                            mode = %config.respond_to,
+                                            is_dm,
+                                            "inbound author gate — dropping event"
+                                        );
+                                    }
                                     continue;
                                 }
                             }
@@ -2736,6 +2805,17 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
     })
 }
 
+/// Whether a rejected author-gate event warrants warning-level operator visibility.
+///
+/// A rejection that explicitly p-tags this agent is actionable because a user
+/// expected a response; other rejected traffic remains debug noise.
+fn author_gate_rejection_is_explicit_mention(
+    event: &nostr::Event,
+    agent_pubkey_hex: &str,
+) -> bool {
+    event_mentions_agent(event, agent_pubkey_hex)
+}
+
 fn is_owner_control_command(
     event: &nostr::Event,
     kind_u32: u32,
@@ -2977,6 +3057,12 @@ fn dispatch_pending(
             )
             .await;
         });
+        spawn_turn_watchdog(
+            abort_handle.clone(),
+            turn_id.clone(),
+            Some(channel_id),
+            ctx.max_turn_duration,
+        );
 
         pool.task_map_mut().insert(
             abort_handle.id(),
@@ -3590,6 +3676,12 @@ fn dispatch_heartbeat(
         )
         .await;
     });
+    spawn_turn_watchdog(
+        abort_handle.clone(),
+        turn_id.clone(),
+        None,
+        ctx.max_turn_duration,
+    );
 
     pool.task_map_mut().insert(
         abort_handle.id(),
@@ -4419,6 +4511,7 @@ mod owner_cache_tests {
 #[cfg(test)]
 mod author_gate_tests {
     use super::*;
+    use nostr::{EventBuilder, Kind, Tag};
 
     /// A `RestClient` for tests. The author-gate decisions exercised here all
     /// resolve from the owner pubkey or sibling cache before any HTTP call, so
@@ -4785,6 +4878,38 @@ mod author_gate_tests {
             is_dm_channel(Uuid::new_v4(), &resolver(HashMap::new())).await,
             "an unresolvable channel type must be treated as a DM"
         );
+    }
+
+    fn event_with_tags(tags: Vec<Tag>) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "test")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign test event")
+    }
+
+    #[test]
+    fn event_mentions_agent_matches_only_the_target_p_tag() {
+        let agent = "aa".repeat(32);
+        let other = "bb".repeat(32);
+
+        let mentioned = event_with_tags(vec![Tag::parse(["p", &agent]).expect("p tag")]);
+        assert!(event_mentions_agent(&mentioned, &agent));
+
+        let other_p_tag = event_with_tags(vec![Tag::parse(["p", &other]).expect("p tag")]);
+        assert!(!event_mentions_agent(&other_p_tag, &agent));
+
+        let non_p_tag = event_with_tags(vec![Tag::parse(["e", &agent]).expect("e tag")]);
+        assert!(!event_mentions_agent(&non_p_tag, &agent));
+    }
+
+    #[test]
+    fn rejected_author_gate_warns_only_for_explicit_agent_mentions() {
+        let agent = "aa".repeat(32);
+        let mentioned = event_with_tags(vec![Tag::parse(["p", &agent]).expect("p tag")]);
+        let unmentioned = event_with_tags(vec![]);
+
+        assert!(author_gate_rejection_is_explicit_mention(&mentioned, &agent));
+        assert!(!author_gate_rejection_is_explicit_mention(&unmentioned, &agent));
     }
 }
 
@@ -5207,7 +5332,7 @@ mod error_outcome_emission_tests {
     use crate::pool::{
         AgentPool, OwnedAgent, PromptOutcome, PromptResult, PromptSource, TimeoutKind,
     };
-    use crate::queue::{BatchEvent, FlushBatch};
+    use crate::queue::{BatchEvent, FlushBatch, QueuedEvent};
     use nostr::{EventBuilder, Keys, Kind};
     use std::collections::HashSet;
 
@@ -5436,6 +5561,109 @@ mod error_outcome_emission_tests {
             Some(channel_id.to_string().as_str())
         );
         assert_eq!(panic.turn_id.as_deref(), Some("panic-turn-id"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_cancellation_releases_channel_and_schedules_slot_recovery() {
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let channel_id = Uuid::new_v4();
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "stuck turn")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign test event");
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "@mention".to_string(),
+        }));
+        let batch = queue.flush_next().expect("dispatch marks channel in flight");
+        assert!(queue.is_channel_in_flight(channel_id));
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let task_id = abort_handle.id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "watchdog-turn-id".to_string(),
+                recoverable_batch: Some(batch),
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        started_rx.await.expect("turn task started");
+
+        spawn_turn_watchdog_after(
+            abort_handle,
+            "watchdog-turn-id".to_string(),
+            Some(channel_id),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        let join_error = pool
+            .join_set
+            .join_next()
+            .await
+            .expect("watchdog-aborted task is reaped")
+            .expect_err("watchdog abort must produce JoinError");
+        assert!(
+            join_error.is_cancelled(),
+            "watchdog abort must follow Tokio's cancelled JoinError path"
+        );
+
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut typing_channels = HashMap::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+
+        recover_panicked_agent(
+            &mut pool,
+            &mut queue,
+            &config,
+            join_error,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut typing_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+        );
+
+        assert!(pool.task_map().is_empty(), "cancelled task metadata is removed");
+        assert!(
+            !queue.is_channel_in_flight(channel_id),
+            "recovery releases the queue in-flight marker"
+        );
+        assert!(
+            crash_history[0].respawn_in_flight,
+            "recovery schedules replacement for the aborted slot"
+        );
+        assert!(
+            observer.snapshot().iter().any(|event| {
+                event.kind == "agent_panic"
+                    && event.turn_id.as_deref() == Some("watchdog-turn-id")
+            }),
+            "cancelled task reaches the shared task-failure recovery path"
+        );
+        respawn_tasks.shutdown().await;
     }
 
     #[tokio::test]
